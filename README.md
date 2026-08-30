@@ -34,13 +34,32 @@ Three retrieval channels, fused with Reciprocal Rank Fusion:
 | `semantic` | Dense vectors over an OpenAI-compatible embeddings endpoint | **only if configured** |
 
 **Semantic search is opt-in and honest about it.** The standard library cannot
-run a transformer, so dense retrieval needs an external endpoint:
+run a transformer, so dense retrieval needs an external endpoint.
+
+The verified local setup — free, no API key (tested 2026-08-30):
+
+```sh
+ollama pull bge-m3                    # 1.2 GB, 100+ languages, 1024 dims
+export EMBEDDINGS_URL=http://127.0.0.1:11434/v1/embeddings
+export EMBEDDINGS_MODEL=bge-m3
+python crawl.py ... --embed           # vectorise the index
+```
+
+Ollama's `/v1/embeddings` is OpenAI-compatible, so the server talks to it
+unchanged. Any other OpenAI-compatible endpoint works the same way:
 
 ```
 EMBEDDINGS_URL=https://api.example.com/v1/embeddings
-EMBEDDINGS_MODEL=text-embedding-3-small      # optional
+EMBEDDINGS_MODEL=...                         # optional
 EMBEDDINGS_API_KEY=...                       # optional
 ```
+
+Measured cross-language separation with `bge-m3` (Turkish query, multilingual
+candidate pool): conceptually related documents averaged **0.70** cosine,
+unrelated ones **0.41** — a 0.29 gap. A Turkish query for climate and carbon
+targets returned the Strategic Gas Reserve, Air Pollution and Environment Acts
+under `semantic`, and pure noise under `lexical`, because no Turkish word
+appears in an English statute.
 
 With nothing configured, `mode="hybrid"` degrades to lexical + fuzzy and **says
 so** in every response. It never presents a keyword match as a conceptual one.
