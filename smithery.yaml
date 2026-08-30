@@ -1,0 +1,38 @@
+runtime: "container"
+
+build:
+  dockerfile: "Dockerfile"
+  dockerBuildPath: "."
+
+startCommand:
+  type: "http"
+  # Everything this server reads from the environment is optional: an
+  # embeddings endpoint to switch the semantic channel on, and crawl arguments
+  # that only change how much gets indexed. It handles no secrets of its own
+  # and stores no client data, so nothing is required.
+  configSchema:
+    type: "object"
+    properties:
+      EMBEDDINGS_URL:
+        type: "string"
+        description: >-
+          OpenAI-compatible /v1/embeddings endpoint. Set it to turn on the
+          semantic retrieval channel. Without it, hybrid search degrades to
+          BM25 + fuzzy and says so in every response.
+      EMBEDDINGS_MODEL:
+        type: "string"
+        description: >-
+          Embedding model name. For cross-language work (asking in one language
+          about a corpus in another) this must be a multilingual model.
+      EMBEDDINGS_API_KEY:
+        type: "string"
+        description: "Bearer token for the embeddings endpoint, if it needs one."
+      CRAWL_ARGS:
+        type: "string"
+        description: >-
+          Arguments passed to crawl.py on first boot when no index exists yet.
+          The crawl runs in the background so the health check passes at once.
+        default: "--max 0"
+    required: []
+  exampleConfig:
+    CRAWL_ARGS: "--max 0"

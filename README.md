@@ -92,6 +92,27 @@ docker run -p 8000:8000 -e PORT=8000 es-boe-mcp
 `CRAWL_ARGS` is set and no index exists yet, so the platform health check at
 `/health` passes straight away.
 
+## Deploying to Smithery
+
+This repo ships `smithery.yaml`, so it can be deployed as a hosted container:
+
+1. Push the repo to GitHub (done).
+2. On [smithery.ai](https://smithery.ai), add the server from this GitHub repo.
+3. Deploy. Smithery builds `Dockerfile` and serves Streamable HTTP on `/mcp`.
+
+Optional configuration, all of it safe to leave empty:
+
+| Variable | Effect |
+|---|---|
+| `CRAWL_ARGS` | What to index on first boot (default `--max 0`) |
+| `EMBEDDINGS_URL` | Turns the semantic channel on |
+| `EMBEDDINGS_MODEL` | Must be multilingual for cross-language search |
+| `EMBEDDINGS_API_KEY` | Bearer token, if the endpoint needs one |
+
+> Container filesystems are usually ephemeral. The index rebuilds on a cold
+> start, which is why the crawl runs in the background and the server answers
+> from the first second — direct fetches and browsing never need an index.
+
 ## Citation discipline
 
 Every result carries a `citation` field built from what the source returned.
