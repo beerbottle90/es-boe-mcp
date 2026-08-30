@@ -48,11 +48,13 @@ import os
 import re
 import sqlite3
 import struct
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__all__ = ["Index", "embeddings_available", "embeddings_status"]
+__all__ = ["Index", "rerank", "semantic_rerank", "embeddings_available",
+           "embeddings_status"]
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -123,34 +125,70 @@ def _fts_query(raw: str, prefix: bool = False, join: str = "AND") -> str:
 # --------------------------------------------------------------------------- #
 # Embeddings backend (optional)                                                #
 # --------------------------------------------------------------------------- #
+# Semantic retrieval should be the normal state, not something an operator has to
+# remember to switch on at launch. When EMBEDDINGS_URL is unset the servers fall
+# back to a local Ollama, which is free, keyless and already the documented
+# setup. Reachability still decides: an unreachable default reports "off" with
+# the reason, exactly as an unset variable used to.
+_DEFAULT_URL = "http://127.0.0.1:11434/v1/embeddings"
+_DEFAULT_MODEL = "bge-m3"
+
+# Liveness is cached so that status calls and per-query checks do not each pay
+# for a network round trip.
+_PROBE_TTL = 60.0
+_probe_cache: Dict[str, Any] = {"at": 0.0, "ok": False, "error": ""}
+
+
+def embeddings_url() -> str:
+    return os.environ.get("EMBEDDINGS_URL") or _DEFAULT_URL
+
+
+def embeddings_model() -> str:
+    return os.environ.get("EMBEDDINGS_MODEL") or _DEFAULT_MODEL
+
+
+def _probe(force: bool = False) -> bool:
+    now = time.time()
+    if not force and now - _probe_cache["at"] < _PROBE_TTL:
+        return bool(_probe_cache["ok"])
+    try:
+        _embed(["ping"], timeout=20)
+        _probe_cache.update(at=now, ok=True, error="")
+    except Exception as exc:  # noqa: BLE001 - unreachable is a reportable state
+        _probe_cache.update(at=now, ok=False,
+                            error="%s: %s" % (type(exc).__name__, exc))
+    return bool(_probe_cache["ok"])
+
+
 def embeddings_available() -> bool:
-    return bool(os.environ.get("EMBEDDINGS_URL"))
+    return _probe()
 
 
 def embeddings_status() -> Dict[str, Any]:
-    if not embeddings_available():
+    source = "env" if os.environ.get("EMBEDDINGS_URL") else "default (local Ollama)"
+    if not _probe():
         return {
             "semantic": "off",
-            "reason": "EMBEDDINGS_URL not set — hybrid search degraded to "
-                      "lexical + fuzzy. Results are keyword matches, not "
-                      "conceptual matches.",
+            "endpoint": embeddings_url(),
+            "endpoint_source": source,
+            "reason": "Embeddings endpoint unreachable (%s) — hybrid search "
+                      "degraded to lexical + fuzzy. Results are keyword matches, "
+                      "not conceptual matches. Start it with: ollama serve && "
+                      "ollama pull %s" % (_probe_cache["error"], embeddings_model()),
         }
     return {
         "semantic": "on",
-        "model": os.environ.get("EMBEDDINGS_MODEL", "(server default)"),
+        "model": embeddings_model(),
+        "endpoint": embeddings_url(),
+        "endpoint_source": source,
         "note": "Cross-language retrieval only works if this model is multilingual.",
     }
 
 
 def _embed(texts: Sequence[str], timeout: int = 60) -> List[List[float]]:
     """Call an OpenAI-compatible /v1/embeddings endpoint. Raises on failure."""
-    url = os.environ.get("EMBEDDINGS_URL")
-    if not url:
-        raise RuntimeError("EMBEDDINGS_URL is not set")
-    payload: Dict[str, Any] = {"input": list(texts)}
-    model = os.environ.get("EMBEDDINGS_MODEL")
-    if model:
-        payload["model"] = model
+    url = os.environ.get("EMBEDDINGS_URL") or _DEFAULT_URL
+    payload: Dict[str, Any] = {"input": list(texts), "model": embeddings_model()}
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -452,3 +490,154 @@ class Index:
         except ValueError:
             out["meta"] = {}
         return out
+
+
+# --------------------------------------------------------------------------- #
+# Ephemeral reranking                                                          #
+# --------------------------------------------------------------------------- #
+def rerank(
+    query: str,
+    docs: Sequence[Dict[str, Any]],
+    fields: Sequence[str] = ("title", "body"),
+    limit: int = 0,
+) -> List[Dict[str, Any]]:
+    """Order an upstream result set by relevance to ``query``, in memory.
+
+    For sources that *search* but do not *rank*. Austria's RIS is the clear case:
+    ``Suchworte=Aktiengesetz`` returns 1,423 correct hits in alphabetical order,
+    so the Aktiengesetz itself is nowhere near the top and the first page is
+    worthless. Same query, reranked by BM25, puts it first.
+
+    Builds a throwaway in-memory FTS5 index over the candidates, so it costs one
+    pass over what the API already returned — no crawl, no persistence.
+
+    Documents that the FTS query does not match keep their original order after
+    the ones that do, rather than being dropped: an upstream hit is still a hit,
+    and silently discarding it would hide results the source did return.
+    """
+    docs = list(docs)
+    if not docs or not query.strip():
+        return docs[: limit or len(docs)]
+
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        'CREATE VIRTUAL TABLE r USING fts5(txt, tokenize="unicode61 remove_diacritics 2")'
+    )
+    for i, doc in enumerate(docs):
+        # enumerate, not docs.index(doc): two identical candidate dicts would
+        # otherwise both map to the first one's rowid and one would be lost.
+        text = " \n ".join(str(doc.get(f) or "") for f in fields)
+        db.execute("INSERT INTO r(rowid, txt) VALUES(?,?)", (i + 1, text))
+
+    ranked: List[Dict[str, Any]] = []
+    seen = set()
+    # Same precision-first ladder as the persistent index.
+    for expr in (
+        _fts_query(query),
+        _fts_query(query, prefix=True),
+        _fts_query(query, prefix=True, join="OR"),
+    ):
+        if not expr:
+            continue
+        try:
+            rows = db.execute(
+                "SELECT rowid, bm25(r) AS s FROM r WHERE r MATCH ? ORDER BY s", (expr,)
+            ).fetchall()
+        except sqlite3.OperationalError:
+            continue
+        for rowid, score in rows:
+            idx = rowid - 1
+            if idx in seen or idx >= len(docs):
+                continue
+            seen.add(idx)
+            item = dict(docs[idx])
+            item["_rerank_score"] = round(-float(score), 6)
+            ranked.append(item)
+        if ranked:
+            break
+
+    # Unmatched candidates keep their upstream order, appended after the matches.
+    for idx, doc in enumerate(docs):
+        if idx not in seen:
+            ranked.append(dict(doc))
+    db.close()
+    return ranked[: limit or len(ranked)]
+
+
+def semantic_rerank(
+    query: str,
+    docs: Sequence[Dict[str, Any]],
+    fields: Sequence[str] = ("title", "body"),
+    limit: int = 0,
+    max_embed: int = 200,
+) -> Dict[str, Any]:
+    """Rerank an upstream result set by meaning, with no index and no crawl.
+
+    For **passthrough** servers — ones that forward a query to an upstream API
+    and return what comes back. They have no local corpus to embed ahead of
+    time, so the usual index-then-search flow does not apply. Here the candidate
+    set is small and already in hand, so query and candidates are embedded in a
+    single call and ranked by cosine. Nothing is stored.
+
+    This is what makes semantic search possible for e-qanun, LexScholar,
+    ResourceContracts and de-eli without changing how they fetch anything.
+
+    The problem it solves is concrete. Searching e-qanun for the Civil Code
+    ("Mülki Məcəllə") returns 623 acts, and the first six are all *amendment
+    decrees* whose titles happen to contain the phrase — the Code itself is
+    buried. The upstream searched correctly; it simply did not rank.
+
+    Falls back to lexical :func:`rerank` when no embeddings backend is
+    configured, and says which path it took in ``method`` so a caller can never
+    mistake a keyword ordering for a conceptual one.
+    """
+    docs = list(docs)
+    if not docs or not query.strip():
+        return {"method": "none", "results": docs[: limit or len(docs)]}
+
+    if not embeddings_available():
+        return {
+            "method": "lexical",
+            "note": "Ranked by BM25 over the candidates. EMBEDDINGS_URL is not "
+                    "set, so this is keyword overlap, not meaning.",
+            "results": rerank(query, docs, fields=fields, limit=limit),
+        }
+
+    # Embedding cost is linear in the candidate count and these are live calls,
+    # so cap it. Anything past the cap keeps its upstream order behind the
+    # reranked head rather than being dropped.
+    head, tail = docs[:max_embed], docs[max_embed:]
+    texts = [" \n ".join(str(d.get(f) or "") for f in fields)[:4000] for d in head]
+    try:
+        vectors = _embed([query] + texts)
+    except Exception as exc:  # noqa: BLE001 - degrade, but never silently
+        return {
+            "method": "lexical",
+            "warning": "Embeddings backend failed (%s: %s) — fell back to BM25. "
+                       "These are keyword matches." % (type(exc).__name__, exc),
+            "results": rerank(query, docs, fields=fields, limit=limit),
+        }
+
+    qv = _normalise(vectors[0])
+    scored = []
+    for doc, vec in zip(head, vectors[1:]):
+        unit = _normalise(vec)
+        scored.append((sum(a * b for a, b in zip(qv, unit)), doc))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    out = []
+    for score, doc in scored:
+        item = dict(doc)
+        # A real cosine, unlike the index path's RRF rank score.
+        item["_similarity"] = round(float(score), 4)
+        out.append(item)
+    out.extend(dict(d) for d in tail)
+    return {
+        "method": "semantic",
+        "model": embeddings_model(),
+        "embedded": len(head),
+        "note": "Ranked by cosine similarity. `_similarity` is a real score "
+                "(0-1); cross-language matching depends on the model being "
+                "multilingual.",
+        "results": out[: limit or len(out)],
+    }
