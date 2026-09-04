@@ -91,7 +91,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS docs_tri USING fts5(
 CREATE TABLE IF NOT EXISTS vecs (
     doc_id INTEGER PRIMARY KEY REFERENCES docs(id) ON DELETE CASCADE,
     dim    INTEGER NOT NULL,
-    vec    BLOB NOT NULL
+    vec    BLOB NOT NULL,
+    model  TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS state (k TEXT PRIMARY KEY, v TEXT NOT NULL);
@@ -185,10 +186,28 @@ def embeddings_status() -> Dict[str, Any]:
     }
 
 
-def _embed(texts: Sequence[str], timeout: int = 60) -> List[List[float]]:
+def _supports_input_type() -> bool:
+    """Whether the configured backend understands Voyage's ``input_type``.
+
+    Voyage prepends a different instruction for queries than for documents, which
+    measurably helps asymmetric retrieval — a short question against long
+    documents, which is exactly this workload. Ollama and OpenAI reject or ignore
+    the field, so it is sent only where it means something. Override with
+    EMBEDDINGS_INPUT_TYPE=0/1 if the auto-detection is ever wrong.
+    """
+    override = os.environ.get("EMBEDDINGS_INPUT_TYPE")
+    if override is not None:
+        return override.strip() not in ("", "0", "false", "no")
+    return "voyageai.com" in embeddings_url()
+
+
+def _embed(texts: Sequence[str], timeout: int = 60,
+           input_type: Optional[str] = None) -> List[List[float]]:
     """Call an OpenAI-compatible /v1/embeddings endpoint. Raises on failure."""
     url = os.environ.get("EMBEDDINGS_URL") or _DEFAULT_URL
     payload: Dict[str, Any] = {"input": list(texts), "model": embeddings_model()}
+    if input_type and _supports_input_type():
+        payload["input_type"] = input_type
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -235,6 +254,13 @@ class Index:
         self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(_SCHEMA)
+        # Older index files predate the model column. Vectors written before it
+        # existed carry an empty model and are treated as belonging to whatever
+        # model is configured now -- they were produced by it, since there was
+        # only ever one.
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(vecs)")}
+        if "model" not in cols:
+            self.db.execute("ALTER TABLE vecs ADD COLUMN model TEXT NOT NULL DEFAULT ''")
         self.db.commit()
 
     # -- writing ---------------------------------------------------------- #
@@ -282,25 +308,32 @@ class Index:
         """Compute and store vectors for documents that lack one."""
         if not embeddings_available():
             return {"embedded": 0, **embeddings_status()}
+        model = embeddings_model()
+        # Only fill gaps for the CURRENT model. Switching models leaves the old
+        # vectors in place but unused, so a switch degrades to "not embedded yet"
+        # rather than to silently comparing vectors from two different spaces --
+        # which would look like it worked, because bge-m3 and voyage-4-lite are
+        # both 1024-dimensional.
         sql = (
             "SELECT d.id, d.title, d.body FROM docs d "
-            "LEFT JOIN vecs v ON v.doc_id = d.id WHERE v.doc_id IS NULL"
+            "LEFT JOIN vecs v ON v.doc_id = d.id AND (v.model = ? OR v.model = '') "
+            "WHERE v.doc_id IS NULL"
         )
         if limit:
             sql += " LIMIT %d" % int(limit)
-        rows = self.db.execute(sql).fetchall()
+        rows = self.db.execute(sql, (model,)).fetchall()
         done = 0
         for i in range(0, len(rows), batch):
             chunk = rows[i : i + batch]
             texts = [
                 ((r["title"] or "") + "\n" + (r["body"] or ""))[:8000] for r in chunk
             ]
-            vectors = _embed(texts)
+            vectors = _embed(texts, input_type="document")
             for row, vec in zip(chunk, vectors):
                 unit = _normalise(vec)
                 self.db.execute(
-                    "INSERT OR REPLACE INTO vecs(doc_id, dim, vec) VALUES(?,?,?)",
-                    (row["id"], len(unit), _pack(unit)),
+                    "INSERT OR REPLACE INTO vecs(doc_id, dim, vec, model) VALUES(?,?,?,?)",
+                    (row["id"], len(unit), _pack(unit), model),
                 )
             self.db.commit()
             done += len(chunk)
@@ -316,6 +349,19 @@ class Index:
 
     def count(self) -> int:
         return int(self.db.execute("SELECT COUNT(*) AS n FROM docs").fetchone()["n"])
+
+    def vector_count(self) -> int:
+        """Documents carrying a vector for the CURRENTLY configured model.
+
+        Reported separately from the document count because the two diverge in
+        the state that is easiest to miss: an index that built but never
+        embedded, or one embedded under a different model. Both leave the
+        semantic channel reporting itself on while contributing nothing.
+        """
+        row = self.db.execute(
+            "SELECT COUNT(*) AS n FROM vecs WHERE model = ? OR model = ''",
+            (embeddings_model(),)).fetchone()
+        return int(row["n"])
 
     # -- reading ---------------------------------------------------------- #
     def _where(self, filters: Dict[str, Any]) -> Tuple[str, List[Any]]:
@@ -385,14 +431,14 @@ class Index:
         if not embeddings_available():
             return []
         try:
-            qvec = _normalise(_embed([query])[0])
+            qvec = _normalise(_embed([query], input_type="query")[0])
         except (urllib.error.URLError, RuntimeError, KeyError, ValueError):
             return []
         where, params = self._where(filters)
         rows = self.db.execute(
             "SELECT v.doc_id AS id, v.dim, v.vec FROM vecs v JOIN docs d ON d.id = v.doc_id "
-            "WHERE 1=1" + where + " LIMIT ?",
-            params + [scan_max],
+            "WHERE (v.model = ? OR v.model = '')" + where + " LIMIT ?",
+            [embeddings_model()] + params + [scan_max],
         ).fetchall()
         scored = []
         qlen = len(qvec)
@@ -462,12 +508,22 @@ class Index:
                 }
             )
 
+        vectors = self.vector_count()
         retrieval = {
             "mode": mode,
             "channels_used": {k: len(v) for k, v in channels.items()},
             "indexed_documents": self.count(),
+            "vectorised_documents": vectors,
             **embeddings_status(),
         }
+        if mode in ("hybrid", "semantic") and embeddings_available() and vectors == 0:
+            retrieval["warning"] = (
+                "Semantic search is configured but NO documents are vectorised "
+                "for model '%s' — the semantic channel contributed nothing and "
+                "these are keyword matches. Run crawl.py --embed (or embed_missing) "
+                "to build vectors, e.g. after switching embedding models."
+                % embeddings_model()
+            )
         if mode in ("hybrid", "semantic") and not embeddings_available():
             retrieval["warning"] = (
                 "Semantic channel unavailable — these are keyword matches. A "
@@ -609,7 +665,11 @@ def semantic_rerank(
     head, tail = docs[:max_embed], docs[max_embed:]
     texts = [" \n ".join(str(d.get(f) or "") for f in fields)[:4000] for d in head]
     try:
-        vectors = _embed([query] + texts)
+        # Query and candidates get different instructions on backends that
+        # support it; the asymmetry is the point of input_type.
+        qv_list = _embed([query], input_type="query")
+        doc_vs = _embed(texts, input_type="document")
+        vectors = qv_list + doc_vs
     except Exception as exc:  # noqa: BLE001 - degrade, but never silently
         return {
             "method": "lexical",
