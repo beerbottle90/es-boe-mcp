@@ -314,9 +314,16 @@ class Index:
         # rather than to silently comparing vectors from two different spaces --
         # which would look like it worked, because bge-m3 and voyage-4-lite are
         # both 1024-dimensional.
+        #
+        # An empty `model` means unknown provenance -- NOT "matches whatever is
+        # current". Accepting it as a match is how a Voyage run against an index
+        # vectorised by bge-m3 found no gaps at all, left every vector in place,
+        # and would have scored them against Voyage queries: the precise failure
+        # this guard exists to prevent. Stamp legacy rows with the model that
+        # actually produced them instead.
         sql = (
             "SELECT d.id, d.title, d.body FROM docs d "
-            "LEFT JOIN vecs v ON v.doc_id = d.id AND (v.model = ? OR v.model = '') "
+            "LEFT JOIN vecs v ON v.doc_id = d.id AND v.model = ? "
             "WHERE v.doc_id IS NULL"
         )
         if limit:
@@ -437,7 +444,7 @@ class Index:
         where, params = self._where(filters)
         rows = self.db.execute(
             "SELECT v.doc_id AS id, v.dim, v.vec FROM vecs v JOIN docs d ON d.id = v.doc_id "
-            "WHERE (v.model = ? OR v.model = '')" + where + " LIMIT ?",
+            "WHERE v.model = ?" + where + " LIMIT ?",
             [embeddings_model()] + params + [scan_max],
         ).fetchall()
         scored = []
