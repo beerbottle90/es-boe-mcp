@@ -5,8 +5,12 @@
 
 What gets indexed, and why only this
 ------------------------------------
-Title, official number, issuing department, rango, dates and ``materias``
-(BOE's own subject tags) — **not** the consolidated body text.
+Title, official number, issuing department, rango, dates and ámbito — **not**
+the consolidated body text, and **not** ``materias``. BOE exposes its subject
+tags only on the per-act detail endpoint, so indexing them would cost one
+request per act (12,376 of them) rather than the ~20 this crawl takes. The
+subject signal therefore comes from the title, which for Spanish legislation is
+descriptive by convention ("Ley 17/2006, de control ambiental integrado").
 
 That is a deliberate trade, not an oversight. A single consolidated act runs to
 roughly a million characters (the Ley de Sociedades de Capital is 960,963), so
