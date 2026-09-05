@@ -155,6 +155,18 @@ def _probe(force: bool = False) -> bool:
     try:
         _embed(["ping"], timeout=20)
         _probe_cache.update(at=now, ok=True, error="")
+    except urllib.error.HTTPError as exc:
+        # The status code alone hides the cause: Voyage answers 401 for a missing
+        # or invalid key but 403 for a key it recognises and refuses (quota,
+        # billing, revoked). Surface the provider's own message so `status`
+        # explains the outage instead of restating the code.
+        try:
+            body = exc.read(600).decode("utf-8", "replace").strip()
+        except Exception:  # noqa: BLE001
+            body = ""
+        _probe_cache.update(at=now, ok=False,
+                            error="HTTP %s %s%s" % (exc.code, exc.reason,
+                                                    (": " + body) if body else ""))
     except Exception as exc:  # noqa: BLE001 - unreachable is a reportable state
         _probe_cache.update(at=now, ok=False,
                             error="%s: %s" % (type(exc).__name__, exc))
@@ -163,6 +175,19 @@ def _probe(force: bool = False) -> bool:
 
 def embeddings_available() -> bool:
     return _probe()
+
+
+def _repair_hint() -> str:
+    """What an operator should do about an unreachable embeddings backend.
+
+    The old hint always said "ollama serve", which is wrong advice when the
+    endpoint is a hosted provider: there the fix is the key or the account.
+    """
+    url = embeddings_url()
+    if "127.0.0.1" in url or "localhost" in url:
+        return "Start it with: ollama serve && ollama pull %s" % embeddings_model()
+    return ("Check EMBEDDINGS_API_KEY and the provider account behind %s "
+            "(key status, quota, billing)." % url)
 
 
 def embeddings_status() -> Dict[str, Any]:
@@ -174,8 +199,8 @@ def embeddings_status() -> Dict[str, Any]:
             "endpoint_source": source,
             "reason": "Embeddings endpoint unreachable (%s) — hybrid search "
                       "degraded to lexical + fuzzy. Results are keyword matches, "
-                      "not conceptual matches. Start it with: ollama serve && "
-                      "ollama pull %s" % (_probe_cache["error"], embeddings_model()),
+                      "not conceptual matches. %s"
+                      % (_probe_cache["error"], _repair_hint()),
         }
     return {
         "semantic": "on",
@@ -211,6 +236,10 @@ def _embed(texts: Sequence[str], timeout: int = 60,
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
+    # A named agent rather than urllib's default: some providers sit behind bot
+    # filters that treat "Python-urllib" from a datacenter address as abuse.
+    req.add_header("User-Agent",
+                   "arthurlegal-mcp/1.0 (+https://github.com/beerbottle90/arthurlegal-mcp)")
     key = os.environ.get("EMBEDDINGS_API_KEY")
     if key:
         req.add_header("Authorization", "Bearer %s" % key)
